@@ -10,9 +10,10 @@ st.set_page_config(page_title="Modèle gains – Acquisition sigmoïde & Confian
 # Constantes verrouillées
 # -----------------------
 CONF_BASE_LENGTH = 10   # confiance base: 1 -> 0 en 10 mois
-CONF_VM_LENGTH   = 10   # campagne VM: 1 -> 0 en 10 mois (aligné avec l'exigence)
+CONF_VM_LENGTH   = 10   # campagne VM: 1 -> 0 en 10 mois
 ACQ_LENGTH       = 6    # acquisition sigmoïde vers la cible en 6 mois
 EXTENSION_MONTHS = 12   # +12 mois d'horizon à chaque extension
+COUT_PROJET      = 50000  # coût fixe projet 6 mois (€)
 
 # -----------------------
 # Helpers
@@ -74,9 +75,7 @@ T = st.session_state.horizon
 t = np.arange(0, T + 1)
 
 # -----------------------
-# Acquisition des médecins (sigmoïde, 6 mois)
-#   Phase 1: 0 -> nb_med_target en 6 mois
-#   Phase 2 (si extension): +nb_med_new à partir de M=12, en 6 mois
+# Acquisition des médecins
 # -----------------------
 med_phase1 = sigmoid_acquisition(t, start_t=0, target_increment=nb_med_target, length=ACQ_LENGTH)
 if st.session_state.extension_active:
@@ -87,10 +86,7 @@ else:
 med_t = med_phase1 + med_phase2
 
 # -----------------------
-# Confiance des médecins (linéaire, 10 mois)
-#   Base : 1 -> 0 de 0 à 10 mois
-#   VM   : 1 -> 0 sur 10 mois à partir du mois choisi
-#   Confiance effective = max(base, VM)
+# Confiance des médecins
 # -----------------------
 c_base = linear_confidence(t, start=0, length=CONF_BASE_LENGTH)
 if st.session_state.vm_month is not None:
@@ -108,17 +104,23 @@ traites_t = diag_t * taux_trait
 revenu_mensuel = traites_t * prix
 revenu_cumule = np.cumsum(revenu_mensuel)
 
+# ROI sur 6 mois
+revenu_6m = revenu_cumule[min(6, len(revenu_cumule)-1)]
+roi = (revenu_6m - COUT_PROJET) / COUT_PROJET if COUT_PROJET > 0 else None
+
 # -----------------------
 # UI — Titre & KPIs
 # -----------------------
-st.title("Modèle de gains – Acquisition (sigmoïde 6m) & Confiance (linéaire 10m)")
-st.caption("Confiance atteint 0 en 10 mois (base et après VM). Acquisition: sigmoïde 6 mois. Extension: +12 mois avec nouvelle vague d’acquisition (6m).")
+st.title("Modèle de gains – ROI projet 6 mois")
+st.caption("Projet de 6 mois avec un coût fixe de 50 000 €. ROI = (Revenu cumulé 6m – Coût) / Coût.")
 
-c1, c2, c3, c4 = st.columns(4)
+c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Médecins à T final", f"{int(round(med_t[-1])):,}".replace(",", " "))
 c2.metric("Diagnostics totaux (0–T)", f"{diag_t.sum():,.0f}".replace(",", " "))
 c3.metric("Patients traités (0–T)", f"{traites_t.sum():,.0f}".replace(",", " "))
 c4.metric("Revenu cumulé (0–T)", f"{revenu_cumule[-1]:,.0f} €".replace(",", " "))
+if roi is not None:
+    c5.metric("ROI (6 mois)", f"{roi*100:.1f} %")
 
 # -----------------------
 # Graphiques
@@ -163,6 +165,7 @@ with tab3:
 with tab4:
     fig4, ax4 = plt.subplots(figsize=(9, 5))
     ax4.plot(t, revenu_cumule, label="Revenu cumulé")
+    ax4.axvline(6, linestyle="--", alpha=0.7, color="red", label="Fin projet 6m")
     ax4.set_title("Revenu cumulé")
     ax4.set_xlabel("Mois")
     ax4.set_ylabel("€")
@@ -186,6 +189,7 @@ df = pd.DataFrame({
 st.dataframe(df, use_container_width=True)
 
 st.info(
-    "La confiance atteint bien 0 en 10 mois, y compris après une campagne VM. "
-    "Chaque extension ajoute 12 mois et une nouvelle vague d’acquisition (sigmoïde 6 mois)."
+    f"ROI calculé sur 6 mois avec un coût projet de 50 000 € : {roi*100:.1f} %."
+    if roi is not None else "Coût projet nul → ROI non défini."
 )
+
