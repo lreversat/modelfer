@@ -1,72 +1,107 @@
 # app.py
 import streamlit as st
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Modèle de gains – carences martiales", layout="wide")
+st.set_page_config(page_title="Modèle de gains – Confiance médecins", layout="wide")
 
-# ---- SIDEBAR : paramètres ----
-st.sidebar.header("Paramètres")
-prix = st.sidebar.number_input("Prix du médicament (€)", min_value=0.0, max_value=10000.0, value=120.0, step=5.0)
-nb_medecins = st.sidebar.slider("Nombre de médecins généralistes", min_value=1, max_value=500, value=50, step=1)
-diag_mois_par_med = st.sidebar.slider("Nb de nouveaux diagnostics / mois / médecin", min_value=0, max_value=100, value=5, step=1)
-taux_traite = st.sidebar.slider("Taux de patients traités (%)", min_value=0, max_value=100, value=40, step=5)
-nb_doses = st.sidebar.slider("Nb de doses par patient", min_value=1, max_value=10, value=1, step=1)
-duree = st.sidebar.slider("Durée (mois)", min_value=1, max_value=24, value=6, step=1)
+# --- SIDEBAR: paramètres ---
+st.sidebar.header("Paramètres principaux")
+prix = st.sidebar.number_input("Prix du médicament (€ / dose)", min_value=0.0, value=120.0, step=5.0)
+nb_med = st.sidebar.slider("Nombre de médecins généralistes", 1, 1000, 50, 1)
+pot_diag = st.sidebar.slider("Potentiel max de diagnostics / mois / médecin", 0, 100, 5, 1)
+taux_trait_pct = st.sidebar.slider("Taux de patients traités (%)", 0, 100, 40, 1)
+nb_doses = st.sidebar.slider("Nb de doses par patient", 1, 10, 1, 1)
 
-st.sidebar.divider()
-st.sidebar.subheader("Afficher aussi les scénarios repères")
-show_20 = st.sidebar.checkbox("20 % traités", value=True)
-show_40 = st.sidebar.checkbox("40 % traités", value=True)
-show_60 = st.sidebar.checkbox("60 % traités", value=True)
+st.sidebar.header("Confiance des médecins")
+c0 = st.sidebar.slider("Confiance initiale C₀ (0–1)", 0.0, 1.0, 1.0, 0.05)
+mode_conf = st.sidebar.selectbox("Forme de décroissance", ["Linéaire (c_10 = 0)", "Exponentielle (≈0 à 10 mois)"])
 
-# ---- Calculs ----
-mois = np.arange(0, duree + 1)  # 0 → durée
-# Gain cumulé = médecins × diagnostics/mois × mois × taux_traitement × doses × prix
-def gains_cumules(taux_pct: float) -> np.ndarray:
-    return nb_medecins * diag_mois_par_med * mois * (taux_pct / 100.0) * nb_doses * prix
+# Paramètre d'exponentielle (optionnel) : demi-vie (en mois)
+t_half = None
+if "Exponentielle" in mode_conf:
+    t_half = st.sidebar.slider("Demi-vie de la confiance (mois)", 1, 10, 4, 1)
 
-# Scénario personnalisé
-gains_custom = gains_cumules(taux_traite)
+# --- Horizon fixe 0..10 mois (confiance nulle au mois 10) ---
+mois = np.arange(0, 11)  # 0..10
 
-# ---- Mise en page ----
-st.title("Modèle de gains – Carences martiales")
-st.caption("Gain cumulé en fonction du temps. Ajuste les paramètres dans la barre latérale.")
+# --- Confiance c_t ---
+if "Linéaire" in mode_conf:
+    c_t = c0 * (1 - mois / 10.0)
+    c_t = np.clip(c_t, 0, 1)
+else:
+    # c(t) = C0 * 0.5**(t/t_half), puis on tronque à 0 après 10
+    c_t = c0 * (0.5 ** (mois / float(t_half)))
+    # force à ~0 au-delà de 10 en coupant à 10 (déjà fait par l'horizon)
+    c_t = np.clip(c_t, 0, 1)
+    # par cohérence avec l'énoncé "nulle à 10 mois"
+    c_t[mois == 10] = 0.0
 
-# KPIs (mois final)
-nb_diag_total = nb_medecins * diag_mois_par_med * duree
-nb_traites_custom = nb_diag_total * (taux_traite/100)
-revenu_total_custom = gains_custom[-1]
+# --- Calculs ---
+taux_trait = taux_trait_pct / 100.0
+diag_t = nb_med * pot_diag * c_t
+traites_t = diag_t * taux_trait
+revenu_mensuel = traites_t * nb_doses * prix
+revenu_cumule = np.cumsum(revenu_mensuel)
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Diagnostics (6 mois)", f"{nb_diag_total:,.0f}".replace(",", " "))
-c2.metric("Patients traités (custom)", f"{nb_traites_custom:,.0f}".replace(",", " "))
-c3.metric("Gain total (custom)", f"{revenu_total_custom:,.0f} €".replace(",", " "))
+# --- KPIs ---
+st.title("Modèle de gains – Confiance des médecins qui décroît jusqu'à 0 à 10 mois")
+st.caption("La confiance module le potentiel de diagnostics. À 10 mois, la confiance est nulle : il faut remotiver les médecins.")
 
-# ---- Graphique ----
-fig, ax = plt.subplots(figsize=(9, 5))
-ax.plot(mois, gains_custom, label=f"Custom – {taux_traite}% traités")
-if show_20: ax.plot(mois, gains_cumules(20), label="Repère – 20%")
-if show_40: ax.plot(mois, gains_cumules(40), label="Repère – 40%")
-if show_60: ax.plot(mois, gains_cumules(60), label="Repère – 60%")
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Diagnostics totaux (0–10)", f"{diag_t.sum():,.0f}".replace(",", " "))
+c2.metric("Patients traités (0–10)", f"{traites_t.sum():,.0f}".replace(",", " "))
+c3.metric("Revenu cumulé (0–10)", f"{revenu_cumule[-1]:,.0f} €".replace(",", " "))
+c4.metric("Confiance initiale C₀", f"{c0:.2f}")
 
-ax.set_title("Gains cumulés selon le temps")
-ax.set_xlabel("Mois")
-ax.set_ylabel("Gain cumulé (€)")
-ax.grid(True)
-ax.legend()
-st.pyplot(fig)
+# --- Graphiques ---
+tab1, tab2, tab3 = st.tabs(["Revenu cumulé", "Revenu mensuel", "Confiance"])
 
-# ---- Tableau récapitulatif (optionnel) ----
-st.subheader("Détails (mois par mois)")
-import pandas as pd
-data = {
+with tab1:
+    fig1, ax1 = plt.subplots(figsize=(9, 5))
+    ax1.plot(mois, revenu_cumule, label="Revenu cumulé (0–10 mois)")
+    ax1.set_xlabel("Mois")
+    ax1.set_ylabel("€")
+    ax1.set_title("Revenu cumulé")
+    ax1.grid(True)
+    ax1.legend()
+    st.pyplot(fig1)
+
+with tab2:
+    fig2, ax2 = plt.subplots(figsize=(9, 5))
+    ax2.bar(mois, revenu_mensuel, label="Revenu mensuel", width=0.7)
+    ax2.set_xlabel("Mois")
+    ax2.set_ylabel("€")
+    ax2.set_title("Revenu mensuel")
+    ax2.grid(True, axis="y")
+    ax2.legend()
+    st.pyplot(fig2)
+
+with tab3:
+    fig3, ax3 = plt.subplots(figsize=(9, 4))
+    ax3.plot(mois, c_t, label="Confiance c(t)")
+    ax3.set_xlabel("Mois")
+    ax3.set_ylabel("Confiance (0–1)")
+    ax3.set_title("Évolution de la confiance (devient nulle au mois 10)")
+    ax3.set_ylim(0, 1.05)
+    ax3.grid(True)
+    ax3.legend()
+    st.pyplot(fig3)
+
+# --- Tableau des valeurs ---
+st.subheader("Détails mois par mois")
+df = pd.DataFrame({
     "Mois": mois,
-    f"Custom {taux_traite}% (€)": gains_custom
-}
-if show_20: data["Repère 20% (€)"] = gains_cumules(20)
-if show_40: data["Repère 40% (€)"] = gains_cumules(40)
-if show_60: data["Repère 60% (€)"] = gains_cumules(60)
-
-df = pd.DataFrame(data)
+    "Confiance c(t)": c_t,
+    "Diagnostics": np.round(diag_t, 2),
+    "Patients traités": np.round(traites_t, 2),
+    "Revenu mensuel (€)": np.round(revenu_mensuel, 2),
+    "Revenu cumulé (€)": np.round(revenu_cumule, 2),
+})
 st.dataframe(df, use_container_width=True)
+
+st.info(
+    "Interprétation : la confiance module directement le volume de diagnostics. "
+    "À 10 mois, elle est nulle ; il faut prévoir une action de remotivation pour réalimenter la dynamique."
+)
