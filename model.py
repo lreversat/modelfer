@@ -4,22 +4,26 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Modèle gains – Acquisition sigmoïde & Confiance (10 mois)", layout="wide")
+st.set_page_config(page_title="Modèle de gains – Sigmoïde & Expo-to-zero", layout="wide")
 
 # -----------------------
 # Constantes verrouillées
 # -----------------------
-CONF_BASE_LENGTH = 10   # confiance base: 1 -> 0 en 10 mois
-CONF_VM_LENGTH   = 10   # campagne VM: 1 -> 0 en 10 mois
-ACQ_LENGTH       = 6    # acquisition sigmoïde vers la cible en 6 mois
-EXTENSION_MONTHS = 12   # +12 mois d'horizon à chaque extension
-COUT_PROJET      = 50000  # coût fixe projet 6 mois (€)
+CONF_T = 10         # la confiance doit atteindre 0 à 10 mois
+CONF_K = 0.25       # oubli moyennement rapide (expo)
+ACQ_LENGTH = 6      # acquisition sigmoïde vers la cible en 6 mois
+EXTENSION_MONTHS = 12
+COUT_PROJET = 50_000  # coût fixe projet 6 mois €
 
 # -----------------------
 # Helpers
 # -----------------------
 def sigmoid_acquisition(t, start_t, target_increment, length=ACQ_LENGTH):
-    """Acquisition sigmoïde de 0 à target_increment en 'length' mois, démarrant à start_t."""
+    """
+    Acquisition sigmoïde de 0 à target_increment en 'length' mois, démarrant à start_t.
+    Calibrée pour ≈1% à start_t et ≈99% à start_t+length.
+    """
+    t = np.asarray(t, dtype=float)
     if length <= 0 or target_increment <= 0:
         return np.zeros_like(t, dtype=float)
     k = (2 * np.log(99)) / length
@@ -28,13 +32,30 @@ def sigmoid_acquisition(t, start_t, target_increment, length=ACQ_LENGTH):
     s = np.clip(s, 0, 1)
     return target_increment * s
 
-def linear_confidence(t, start, length):
-    """Confiance linéaire: 1 à start puis décroît à 0 à start+length, 0 ensuite."""
-    c = np.zeros_like(t, dtype=float)
-    mask = (t >= start) & (t <= start + length)
-    c[mask] = 1 - (t[mask] - start) / float(length)
-    c[t > start + length] = 0.0
-    return np.clip(c, 0, 1)
+def confidence_exp_to_zero(t, k=CONF_K, T=CONF_T):
+    """
+    Exponentielle normalisée: c(0)=1, c(T)=0 ; c(t)=0 au-delà de T.
+    c(t) = (exp(-k t) - exp(-k T)) / (1 - exp(-k T))
+    """
+    t = np.asarray(t, dtype=float)
+    num = np.exp(-k * t) - np.exp(-k * T)
+    den = 1.0 - np.exp(-k * T)
+    c = np.clip(num / den, 0.0, 1.0)
+    c[t >= T] = 0.0
+    return c
+
+def confidence_with_vm_exp(t, vm_month=None, k=CONF_K, T=CONF_T):
+    """
+    Combine la confiance de base et, si vm_month est fixé, une relance VM (reset) de 10 mois,
+    en prenant le max des deux.
+    """
+    t = np.asarray(t, dtype=float)
+    c_base = confidence_exp_to_zero(t, k=k, T=T)
+    if vm_month is None:
+        return c_base
+    tau = np.maximum(0.0, t - vm_month)  # temps relatif depuis VM
+    c_vm = confidence_exp_to_zero(tau, k=k, T=T)
+    return np.maximum(c_base, c_vm)
 
 # -----------------------
 # Session state defaults
@@ -49,20 +70,20 @@ if "extension_active" not in st.session_state:
 # -----------------------
 # Sidebar — paramètres
 # -----------------------
-st.sidebar.header("Paramètres principaux")
+st.sidebar.header("Paramètres")
 prix = st.sidebar.number_input("Prix du médicament (€ / patient)", min_value=0.0, value=120.0, step=5.0)
 nb_med_target = st.sidebar.slider("Médecins cible (cycle courant)", 1, 2000, 50, 1)
 pot_diag = st.sidebar.slider("Potentiel max de diagnostics / mois / médecin", 0, 100, 5, 1)
 taux_trait_pct = st.sidebar.slider("Taux de patients traités (%)", 0, 100, 40, 1)
 
 st.sidebar.divider()
-st.sidebar.subheader("Campagne VM (relance de confiance)")
+st.sidebar.subheader("Campagne VM (relance de confiance, 10 mois)")
 vm_select = st.sidebar.slider("Mois de la campagne VM", 0, st.session_state.horizon, min(6, st.session_state.horizon), 1)
 if st.sidebar.button("Lancer une campagne VM"):
     st.session_state.vm_month = int(vm_select)
 
 st.sidebar.divider()
-st.sidebar.subheader("Extension (+12 mois verrouillé)")
+st.sidebar.subheader("Extension (+12 mois, acquisition 6 mois)")
 nb_med_new = st.sidebar.slider("Nouveaux médecins à recruter (extension)", 0, 5000, 50, 1)
 if st.sidebar.button("Ajouter +12 mois & recruter"):
     st.session_state.horizon += EXTENSION_MONTHS
@@ -75,7 +96,9 @@ T = st.session_state.horizon
 t = np.arange(0, T + 1)
 
 # -----------------------
-# Acquisition des médecins
+# Acquisition des médecins (sigmoïde 6 mois)
+#   Phase 1: 0 -> nb_med_target en 6 mois
+#   Phase 2 (si extension): +nb_med_new à partir de M=12, en 6 mois
 # -----------------------
 med_phase1 = sigmoid_acquisition(t, start_t=0, target_increment=nb_med_target, length=ACQ_LENGTH)
 if st.session_state.extension_active:
@@ -86,14 +109,15 @@ else:
 med_t = med_phase1 + med_phase2
 
 # -----------------------
-# Confiance des médecins
+# Confiance des médecins (expo-to-zero 10 mois)
+#   Base : expo normalisée 0->10
+#   VM   : reset, même expo sur 10 mois à partir de vm_month
+#   Confiance effective = max(base, VM)
 # -----------------------
-c_base = linear_confidence(t, start=0, length=CONF_BASE_LENGTH)
 if st.session_state.vm_month is not None:
-    c_vm = linear_confidence(t, start=st.session_state.vm_month, length=CONF_VM_LENGTH)
-    c_t = np.maximum(c_base, c_vm)
+    c_t = confidence_with_vm_exp(t, vm_month=st.session_state.vm_month, k=CONF_K, T=CONF_T)
 else:
-    c_t = c_base
+    c_t = confidence_exp_to_zero(t, k=CONF_K, T=CONF_T)
 
 # -----------------------
 # Calculs
@@ -111,8 +135,8 @@ roi = (revenu_6m - COUT_PROJET) / COUT_PROJET if COUT_PROJET > 0 else None
 # -----------------------
 # UI — Titre & KPIs
 # -----------------------
-st.title("Modèle de gains – ROI projet 6 mois")
-st.caption("Projet de 6 mois avec un coût fixe de 50 000 €. ROI = (Revenu cumulé 6m – Coût) / Coût.")
+st.title("Modèle de gains – Acquisition (sigmoïde 6m) & Confiance (expo-to-zero 10m)")
+st.caption("Confiance: exponentielle normalisée (k=0.25), c(0)=1 → c(10)=0. Acquisition: sigmoïde 6m. Extension: +12m avec nouvelle acquisition. ROI calculé sur 6 mois.")
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Médecins à T final", f"{int(round(med_t[-1])):,}".replace(",", " "))
@@ -144,7 +168,7 @@ with tab2:
     ax2.plot(t, c_t, label="Confiance c(t)")
     if st.session_state.vm_month is not None:
         ax2.axvline(st.session_state.vm_month, linestyle="--", alpha=0.7, label="Campagne VM")
-    ax2.set_title("Confiance linéaire (atteint 0 en 10 mois)")
+    ax2.set_title("Confiance (exponentielle normalisée, 10 mois)")
     ax2.set_xlabel("Mois")
     ax2.set_ylabel("Confiance (0–1)")
     ax2.set_ylim(0, 1.05)
@@ -165,7 +189,7 @@ with tab3:
 with tab4:
     fig4, ax4 = plt.subplots(figsize=(9, 5))
     ax4.plot(t, revenu_cumule, label="Revenu cumulé")
-    ax4.axvline(6, linestyle="--", alpha=0.7, color="red", label="Fin projet 6m")
+    ax4.axvline(6, linestyle="--", alpha=0.7, label="Fin projet 6m")
     ax4.set_title("Revenu cumulé")
     ax4.set_xlabel("Mois")
     ax4.set_ylabel("€")
@@ -188,8 +212,13 @@ df = pd.DataFrame({
 })
 st.dataframe(df, use_container_width=True)
 
+# -----------------------
+# Info
+# -----------------------
 st.info(
-    f"ROI calculé sur 6 mois avec un coût projet de 50 000 € : {roi*100:.1f} %."
-    if roi is not None else "Coût projet nul → ROI non défini."
+    "Confiance: exponentielle normalisée vers 0 en 10 mois (k=0.25). "
+    "La campagne VM réinitialise la courbe au mois choisi pour un nouveau cycle de 10 mois. "
+    "Le ROI est calculé sur 6 mois avec un coût fixe de 50 000 €."
 )
+
 
