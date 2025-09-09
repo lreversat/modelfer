@@ -4,25 +4,22 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Modèle de gains – Sigmoïde & Expo-to-zero", layout="wide")
+st.set_page_config(page_title="Modèle de gains – Sigmoïde & Late-drop", layout="wide")
 
 # -----------------------
 # Constantes verrouillées
 # -----------------------
 CONF_T = 10         # la confiance doit atteindre 0 à 10 mois
-CONF_K = 0.25       # oubli moyennement rapide (expo)
+CONF_P = 3.0        # exponent 'late-drop' (>1 = quasi stable au début, plus raide à la fin)
 ACQ_LENGTH = 6      # acquisition sigmoïde vers la cible en 6 mois
 EXTENSION_MONTHS = 12
-COUT_PROJET = 50_000  # coût fixe projet 6 mois €
+COUT_PROJET = 50_000  # coût fixe projet €
 
 # -----------------------
 # Helpers
 # -----------------------
 def sigmoid_acquisition(t, start_t, target_increment, length=ACQ_LENGTH):
-    """
-    Acquisition sigmoïde de 0 à target_increment en 'length' mois, démarrant à start_t.
-    Calibrée pour ≈1% à start_t et ≈99% à start_t+length.
-    """
+    """Acquisition sigmoïde de 0 à target_increment en 'length' mois, démarrant à start_t."""
     t = np.asarray(t, dtype=float)
     if length <= 0 or target_increment <= 0:
         return np.zeros_like(t, dtype=float)
@@ -32,36 +29,31 @@ def sigmoid_acquisition(t, start_t, target_increment, length=ACQ_LENGTH):
     s = np.clip(s, 0, 1)
     return target_increment * s
 
-def confidence_exp_to_zero(t, k=CONF_K, T=CONF_T):
-    """
-    Exponentielle normalisée: c(0)=1, c(T)=0 ; c(t)=0 au-delà de T.
-    c(t) = (exp(-k t) - exp(-k T)) / (1 - exp(-k T))
-    """
+def confidence_late_drop(t, T=CONF_T, p=CONF_P):
+    """Confiance 'late-drop' : (1 - t/T)^p, quasi stable au début, chute forte en fin de période."""
     t = np.asarray(t, dtype=float)
-    num = np.exp(-k * t) - np.exp(-k * T)
-    den = 1.0 - np.exp(-k * T)
-    c = np.clip(num / den, 0.0, 1.0)
-    c[t >= T] = 0.0
-    return c
+    c = np.zeros_like(t, dtype=float)
+    mask = (t >= 0) & (t <= T)
+    x = t[mask] / float(T)
+    c[mask] = (1.0 - x) ** p
+    c[t > T] = 0.0
+    return np.clip(c, 0.0, 1.0)
 
-def confidence_with_vm_exp(t, vm_month=None, k=CONF_K, T=CONF_T):
-    """
-    Combine la confiance de base et, si vm_month est fixé, une relance VM (reset) de 10 mois,
-    en prenant le max des deux.
-    """
+def confidence_with_vm_late_drop(t, vm_month=None, T=CONF_T, p=CONF_P):
+    """Combine base et VM (reset), en reprenant le même profil sur 10 mois."""
     t = np.asarray(t, dtype=float)
-    c_base = confidence_exp_to_zero(t, k=k, T=T)
+    c_base = confidence_late_drop(t, T=T, p=p)
     if vm_month is None:
         return c_base
-    tau = np.maximum(0.0, t - vm_month)  # temps relatif depuis VM
-    c_vm = confidence_exp_to_zero(tau, k=k, T=T)
+    tau = np.maximum(0.0, t - vm_month)
+    c_vm = confidence_late_drop(tau, T=T, p=p)
     return np.maximum(c_base, c_vm)
 
 # -----------------------
 # Session state defaults
 # -----------------------
 if "horizon" not in st.session_state:
-    st.session_state.horizon = 12  # 0..12
+    st.session_state.horizon = 12
 if "vm_month" not in st.session_state:
     st.session_state.vm_month = None
 if "extension_active" not in st.session_state:
@@ -77,7 +69,7 @@ pot_diag = st.sidebar.slider("Potentiel max de diagnostics / mois / médecin", 0
 taux_trait_pct = st.sidebar.slider("Taux de patients traités (%)", 0, 100, 40, 1)
 
 st.sidebar.divider()
-st.sidebar.subheader("Campagne VM (relance de confiance, 10 mois)")
+st.sidebar.subheader("Campagne VM (relance de confiance, profil 10 mois)")
 vm_select = st.sidebar.slider("Mois de la campagne VM", 0, st.session_state.horizon, min(6, st.session_state.horizon), 1)
 if st.sidebar.button("Lancer une campagne VM"):
     st.session_state.vm_month = int(vm_select)
@@ -92,13 +84,11 @@ if st.sidebar.button("Ajouter +12 mois & recruter"):
 # -----------------------
 # Horizon temporel
 # -----------------------
-T = st.session_state.horizon
-t = np.arange(0, T + 1)
+T_end = st.session_state.horizon
+t = np.arange(0, T_end + 1)
 
 # -----------------------
-# Acquisition des médecins (sigmoïde 6 mois)
-#   Phase 1: 0 -> nb_med_target en 6 mois
-#   Phase 2 (si extension): +nb_med_new à partir de M=12, en 6 mois
+# Acquisition des médecins
 # -----------------------
 med_phase1 = sigmoid_acquisition(t, start_t=0, target_increment=nb_med_target, length=ACQ_LENGTH)
 if st.session_state.extension_active:
@@ -109,15 +99,12 @@ else:
 med_t = med_phase1 + med_phase2
 
 # -----------------------
-# Confiance des médecins (expo-to-zero 10 mois)
-#   Base : expo normalisée 0->10
-#   VM   : reset, même expo sur 10 mois à partir de vm_month
-#   Confiance effective = max(base, VM)
+# Confiance
 # -----------------------
 if st.session_state.vm_month is not None:
-    c_t = confidence_with_vm_exp(t, vm_month=st.session_state.vm_month, k=CONF_K, T=CONF_T)
+    c_t = confidence_with_vm_late_drop(t, vm_month=st.session_state.vm_month, T=CONF_T, p=CONF_P)
 else:
-    c_t = confidence_exp_to_zero(t, k=CONF_K, T=CONF_T)
+    c_t = confidence_late_drop(t, T=CONF_T, p=CONF_P)
 
 # -----------------------
 # Calculs
@@ -128,15 +115,15 @@ traites_t = diag_t * taux_trait
 revenu_mensuel = traites_t * prix
 revenu_cumule = np.cumsum(revenu_mensuel)
 
-# ROI sur 6 mois
-revenu_6m = revenu_cumule[min(6, len(revenu_cumule)-1)]
-roi = (revenu_6m - COUT_PROJET) / COUT_PROJET if COUT_PROJET > 0 else None
+# ROI sur 12 mois
+revenu_12m = revenu_cumule[min(12, len(revenu_cumule)-1)]
+roi = (revenu_12m - COUT_PROJET) / COUT_PROJET if COUT_PROJET > 0 else None
 
 # -----------------------
 # UI — Titre & KPIs
 # -----------------------
-st.title("Modèle de gains – Acquisition (sigmoïde 6m) & Confiance (expo-to-zero 10m)")
-st.caption("Confiance: exponentielle normalisée (k=0.25), c(0)=1 → c(10)=0. Acquisition: sigmoïde 6m. Extension: +12m avec nouvelle acquisition. ROI calculé sur 6 mois.")
+st.title("Modèle de gains – Acquisition (sigmoïde 6m) & Confiance (late-drop 10m)")
+st.caption("ROI calculé sur 12 mois avec un coût projet fixe de 50 000 €.")
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Médecins à T final", f"{int(round(med_t[-1])):,}".replace(",", " "))
@@ -144,7 +131,7 @@ c2.metric("Diagnostics totaux (0–T)", f"{diag_t.sum():,.0f}".replace(",", " ")
 c3.metric("Patients traités (0–T)", f"{traites_t.sum():,.0f}".replace(",", " "))
 c4.metric("Revenu cumulé (0–T)", f"{revenu_cumule[-1]:,.0f} €".replace(",", " "))
 if roi is not None:
-    c5.metric("ROI (6 mois)", f"{roi*100:.1f} %")
+    c5.metric("ROI (12 mois)", f"{roi*100:.1f} %")
 
 # -----------------------
 # Graphiques
@@ -168,7 +155,7 @@ with tab2:
     ax2.plot(t, c_t, label="Confiance c(t)")
     if st.session_state.vm_month is not None:
         ax2.axvline(st.session_state.vm_month, linestyle="--", alpha=0.7, label="Campagne VM")
-    ax2.set_title("Confiance (exponentielle normalisée, 10 mois)")
+    ax2.set_title("Confiance (late-drop, 10 mois)")
     ax2.set_xlabel("Mois")
     ax2.set_ylabel("Confiance (0–1)")
     ax2.set_ylim(0, 1.05)
@@ -189,7 +176,7 @@ with tab3:
 with tab4:
     fig4, ax4 = plt.subplots(figsize=(9, 5))
     ax4.plot(t, revenu_cumule, label="Revenu cumulé")
-    ax4.axvline(6, linestyle="--", alpha=0.7, label="Fin projet 6m")
+    ax4.axvline(12, linestyle="--", alpha=0.7, label="Fin projet 12m")
     ax4.set_title("Revenu cumulé")
     ax4.set_xlabel("Mois")
     ax4.set_ylabel("€")
@@ -212,13 +199,6 @@ df = pd.DataFrame({
 })
 st.dataframe(df, use_container_width=True)
 
-# -----------------------
-# Info
-# -----------------------
 st.info(
-    "Confiance: exponentielle normalisée vers 0 en 10 mois (k=0.25). "
-    "La campagne VM réinitialise la courbe au mois choisi pour un nouveau cycle de 10 mois. "
-    "Le ROI est calculé sur 6 mois avec un coût fixe de 50 000 €."
+    f"ROI calculé sur 12 mois avec un coût projet de 50 000 € : {roi*100:.1f}%"
 )
-
-
