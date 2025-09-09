@@ -219,4 +219,3 @@ st.info(
     "La campagne VM réinitialise la confiance pour un nouveau cycle de 10 mois. "
     "Le ROI est calculé sur 12 mois avec un coût projet de 50 000 €."
 )
-
